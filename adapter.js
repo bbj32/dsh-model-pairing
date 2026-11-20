@@ -44,14 +44,20 @@ export class OrchestratorAdapter extends LlmAdapter {
     if (model !== MODEL) throw new LlmError('Unknown orchestration model.', 'INVALID_MODEL_INFO')
     const agent = this.ctx.agents.currentInitiator()
     if (!agent) return { ...modelInfo }
-    const pair = this.read(agent.session).roles ?? this.rolesFor(agent)
+    const pair = (agent.status === 'running' && this.read(agent.session).roles) || this.rolesFor(agent)
     if (!pair) return { ...modelInfo }
-    // Only claim the capacity that both roles can use. Leaving modalities open
-    // preserves attachments until the underlying adapter projects them itself.
     const routes = [pair.planner, pair.executor]
     const infos = await Promise.all(routes.map(route => this.ctx.llm.resolveModelInfo(route.provider, route.model, signal)))
     const sizes = infos.map(info => info.context?.contextWindow)
-    return sizes.every(size => size > 0) ? { ...modelInfo, context: { contextWindow: Math.min(...sizes) } } : { ...modelInfo }
+    // Preserve shared images for the visual role in a mixed pair. The prepared
+    // underlying route projects them and decides whether it can use read_image.
+    const acceptsImages = infos.some(info => info.inputModalities?.includes('image'))
+    const inputModalities = acceptsImages ? ['text', 'image'] : infos.every(info => info.inputModalities) ? ['text'] : undefined
+    return {
+      ...modelInfo,
+      ...(sizes.every(size => size > 0) ? { context: { contextWindow: Math.min(...sizes) } } : {}),
+      ...(inputModalities ? { inputModalities } : {}),
+    }
   }
 
   async *stream(options) {
@@ -68,11 +74,13 @@ export class OrchestratorAdapter extends LlmAdapter {
     // backend's registration order alone must not disturb its prompt prefix.
     const { toolHistory, tools, reasoningEffort, ...base } = options
     if (!isConversation) { yield* this.ctx.llm.stream({ ...base, ...actor, tools, messages: neutralMessages(options.messages) }); return }
-    if (state.repairs >= 2) { yield failed('The selected role twice returned a plan or invalid decision instead of the requested action. Its responses are available in the session details.'); return }
-    const allowed = (tools ?? []).filter(tool => stage === 'execute' || readOnlyTool(tool.name)).sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0)
+    if (state.repairs >= 2) { yield failed(`The ${stage} step did not produce a usable decision after two attempts. See its responses in the session details.`); return }
     const controls = { ...actor, ...base.temperature === undefined ? {} : { temperature: base.temperature }, ...base.maxTokens === undefined ? {} : { maxTokens: base.maxTokens }, ...base.stop === undefined ? {} : { stop: base.stop } }
     const prepared = await this.ctx.llm.prepareCall(controls, options.signal)
     const effectiveActor = realRoute(prepared.config)
+    const acceptsImages = prepared.inputModalities?.includes('image')
+    const allowed = (tools ?? []).filter(tool => (stage === 'execute' || readOnlyTool(tool.name))
+      && (tool.name !== 'read_image' || acceptsImages)).sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0)
     const guide = workspacePreviewGuide(tools)
     const { scope, before, messages, system } = roleRequest(base, prepared.config, stage, allowed, guide)
     const request = { ...base, ...prepared.config, messages, system, ...(allowed.length ? { tools: allowed } : {}) }
@@ -147,10 +155,19 @@ export class OrchestratorAdapter extends LlmAdapter {
     // takes the ordinary tools path with its native ID and real result.
     const toolFreeReply = streamed !== null && !allowed.length
     const output = toolFreeReply && calls.length ? raw.filter(block => block.type !== 'tool-call') : raw
-    const evidence = { needsAction, preview, executorTools: state.executorTools, successfulTools: state.successfulTools }
+    const evidence = {
+      needsAction, preview, executorTools: state.executorTools, successfulTools: state.successfulTools,
+      hasPlan: Boolean(state.plan), periodicReview: state.view.reason === 'periodic_review',
+      resumedAutomatically: state.resumedAutomatically,
+      executionOnly: restricted.length ? new Set((tools ?? []).filter(tool => !readOnlyTool(tool.name)).map(tool => tool.name)) : undefined,
+    }
     const decision = finish.kind === 'max-tokens' ? { action: 'limit', summary: '' }
       : decide(stage, output, toolFreeReply ? [] : restricted, steered, evidence)
-    const receipt = { owner: SOURCE, version: 1, phase: stage, actor: effectiveActor, action: decision.action, summary: decision.summary, reviewEvery: this.reviewEvery() }
+    const receipt = {
+      owner: SOURCE, version: 1, phase: stage, actor: effectiveActor, action: decision.action,
+      summary: decision.summary, reviewEvery: this.reviewEvery(),
+      ...(decision.automaticResume ? { automaticResume: true } : {}),
+    }
     const internal = decision.action !== 'answer' && (decision.action !== 'limit' || stage === 'execute')
     const suppressed = decision.corrected || decision.action === 'repair' || steered
     let blocks

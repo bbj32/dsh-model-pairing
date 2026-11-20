@@ -10,7 +10,7 @@ import { pathToFileURL } from 'node:url'
 const browserDirectory = process.env.DSH_TEST_BROWSER_DIR
 const skip = browserDirectory ? false : 'Set DSH_TEST_BROWSER_DIR to the local dsh-browser package directory.'
 
-await test('paired models open a workspace SVG, compare screenshots and review the result', { skip }, async () => {
+await test('paired models review a workspace SVG and read images according to role capability', { skip }, async () => {
   // The two Host plugins run in an independent DSH context with synthetic models.
   assert.ok(process.env.DSH_INSTALL_DIR, 'Set DSH_INSTALL_DIR to the installed @deepseek-ai/dsh package directory.')
   const runtime = createRequire(path.join(process.env.DSH_INSTALL_DIR, 'package.json'))
@@ -31,7 +31,18 @@ await test('paired models open a workspace SVG, compare screenshots and review t
   const call = (id, name, args) => ({ type: 'tool-call', id, name, arguments: JSON.stringify(args) })
   const plans = [
     text('[ORCH:DELEGATE]\nOpen the workspace illustration and verify two animation phases and the console.'),
-    text('[ORCH:ANSWER]\n已验证动画的两个相位，控制台没有错误。'),
+    { failure: { message: 'Offload the oldest image.', code: 'IMAGE_OFFLOAD_REQUIRED', offloadImages: 1 } },
+    options => {
+      const first = options.messages.find(message => message.toolCallId === 'first')
+      assert.ok(first?.content.some(block => block.type === 'image' && block.offloaded))
+      assert.ok(options.tools.some(tool => tool.name === 'read_image'))
+      return call('read-snapshot', 'read_image', { file_path: 'fixture-capture.png' })
+    },
+    options => {
+      const snapshot = options.messages.find(message => message.toolCallId === 'read-snapshot')
+      assert.ok(snapshot?.content.some(block => block.type === 'image' && !block.offloaded))
+      return text('[ORCH:ANSWER]\n已验证动画的两个相位，控制台没有错误。')
+    },
   ]
   const steps = [
     call('open', 'browser_act', { action: 'navigate', url: 'sample.svg' }),
@@ -42,16 +53,22 @@ await test('paired models open a workspace SVG, compare screenshots and review t
   ]
 
   class LocalModel extends LlmAdapter {
-    constructor(provider, sequence) {
+    constructor(provider, sequence, inputModalities = ['text', 'image']) {
       super()
       this.provider = provider
       this.sequence = sequence
+      this.inputModalities = inputModalities
     }
-    async listModels() { return [{ provider: this.provider, id: 'local', name: 'Local deterministic fixture' }] }
+    async listModels() { return [{ provider: this.provider, id: 'local', name: 'Local deterministic fixture', inputModalities: this.inputModalities }] }
     async resolveModel() { return (await this.listModels())[0] }
     async *stream(options) {
-      const next = this.sequence.shift()
-      assert.ok(next, 'Unexpected extra model request')
+      const action = this.sequence.shift()
+      assert.ok(action, 'Unexpected extra model request')
+      const next = typeof action === 'function' ? action(options) : action
+      if (next.failure) {
+        yield { type: 'finish', reason: { kind: 'error', failure: next.failure } }
+        return
+      }
       calls.push({ provider: this.provider, sessionId: options.sessionId })
       yield { type: 'block-end', index: 0, block: next }
       yield { type: 'usage', usage: { inputTokens: 128, outputTokens: 15 } }
@@ -96,13 +113,22 @@ await test('paired models open a workspace SVG, compare screenshots and review t
       browserPeer: peer, admit: () => ({ peer }),
       fetch: { register(route) { routes.set(route.path, route); return () => routes.delete(route.path) } },
     })
-    ctx.set('attachments', { async saveImage({ data, mediaType, name }) {
-      const attachmentId = createHash('sha256').update(data).digest('hex')
-      shots.push(attachmentId)
-      assert.equal(mediaType, 'image/png')
-      assert.deepEqual(data.subarray(0, 8), Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
-      return { attachmentId, mediaType, name, bytes: data.length, width: data.readUInt32BE(16), height: data.readUInt32BE(20) }
-    } })
+    ctx.set('attachments', {
+      imageLimits: { mediaTypes: ['image/png'], maxImageBytes: 5_000_000, maxMessageImageBytes: 5_000_000 },
+      async saveImage({ data, mediaType, name }) {
+        const bytes = Buffer.from(data)
+        assert.equal(mediaType, 'image/png')
+        assert.deepEqual(bytes.subarray(0, 8), Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
+        const attachmentId = createHash('sha256').update(bytes).digest('hex')
+        if (name !== 'fixture-capture.png') {
+          if (!shots.length) await writeFile(path.join(temp, 'fixture-capture.png'), bytes)
+          shots.push(attachmentId)
+        }
+        return { attachmentId, mediaType, name, bytes: bytes.length, width: bytes.readUInt32BE(16), height: bytes.readUInt32BE(20) }
+      },
+    })
+    await mount('dsh-tool-fs', { read: false, write: false, edit: false })
+    await mount('dsh-compaction-image-offload')
     ctx.set('subagents', { rootOf: agent => agent, namesOf: () => ({ self: 'fixture' }) })
     const origin = 'http://fixture.invalid'
     ctx.set('webServer', { getOrigin: () => origin })
@@ -136,8 +162,10 @@ await test('paired models open a workspace SVG, compare screenshots and review t
     const ended = events.findLast(event => event.type === 'turn/end')
     assert.equal(ended?.data.reason.kind, 'completed', JSON.stringify(ended?.data))
     assert.equal(events.some(event => event.type === 'command/run' || event.type === 'command/done'), false)
-    assert.deepEqual(results.map(message => message.toolCallId), ['open', 'first', 'second', 'console'])
-    const diagnostic = JSON.parse(results.at(-1).content.find(block => block.type === 'text').text)
+    assert.deepEqual(results.map(message => message.toolCallId), ['open', 'first', 'second', 'console', 'read-snapshot'])
+    assert.equal(results.at(-1).content.find(block => block.type === 'image').attachment.attachmentId, shots[0])
+    assert.equal(events.filter(event => event.type === 'image/offload').length, 1)
+    const diagnostic = JSON.parse(results.find(message => message.toolCallId === 'console').content.find(block => block.type === 'text').text)
     assert.deepEqual(diagnostic.console, [])
     assert.equal(shots.length, 2)
     assert.notEqual(shots[0], shots[1])
@@ -149,6 +177,41 @@ await test('paired models open a workspace SVG, compare screenshots and review t
     assert.ok(hidden.every(message => message.content.some(block => block.type === 'reasoning')))
     assert.equal(plans.length + steps.length, 0)
     assert.ok(calls.every(call => call.sessionId === agent.id))
+
+    const textRoute = { provider: 'fixture-text', model: 'local' }
+    const expectTextOnly = options => {
+      assert.ok(!options.tools.some(tool => tool.name === 'read_image'))
+      assert.ok(options.messages.every(message => !message.content.some(block => block.type === 'image')))
+    }
+    const textSteps = [
+      options => { expectTextOnly(options); return text('[ORCH:DELEGATE]\nRead the saved image and report its dimensions.') },
+      options => { expectTextOnly(options); return text('[ORCH:ANSWER]\nThe image dimensions were verified.') },
+      options => { expectTextOnly(options); return text('[ORCH:ANSWER]\nThe text summary is ready.') },
+    ]
+    ctx.llm.registerAdapter([textRoute.provider], new LocalModel(textRoute.provider, textSteps, ['text']))
+    steps.push(
+      options => {
+        assert.ok(options.tools.some(tool => tool.name === 'read_image'))
+        assert.ok(options.messages.some(message => message.content.some(block => block.type === 'image' && !block.offloaded)))
+        return call('mixed-read', 'read_image', { file_path: 'fixture-capture.png' })
+      },
+      text('[ORCH:REVIEW]\nThe saved image dimensions were read.'),
+    )
+    for (const [pair, prompt] of [
+      [{ planner: textRoute, executor: selection.executor }, 'Check the dimensions of the preview image.'],
+      [{ planner: textRoute, executor: textRoute }, 'Summarize the result.'],
+    ]) {
+      const changed = await ctx.commands.execute(agent, `/orchestrator set ${JSON.stringify(pair)}`, [], signal)
+      assert.equal(changed.result.kind, 'success', changed.result.text)
+      agent.followup(createUserMessage({ source: { kind: 'user' }, content: [text(prompt)] }))
+      await agent.whenIdle()
+      signal.throwIfAborted()
+      const last = agent.session.snapshotEvents().findLast(event => event.type === 'turn/end')
+      assert.equal(last?.data.reason.kind, 'completed', JSON.stringify(last?.data))
+    }
+    const mixedRead = agent.session.snapshotEvents().find(event => event.type === 'tool/result' && event.data.message.toolCallId === 'mixed-read')
+    assert.equal(mixedRead?.data.message.isError, false)
+    assert.equal(textSteps.length + steps.length, 0)
   } finally {
     try { await ctx.fiber.dispose() } finally {
       const owned = await realpath(temp)

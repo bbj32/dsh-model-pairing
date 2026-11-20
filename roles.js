@@ -25,26 +25,26 @@ export function stageMessage(phase, reason, roles, state) {
   const executor = phase === 'execute'
   const actor = executor ? roles.executor : roles.planner
   const guide = executor ? [
-    'Carry out the latest user request now. Use the agreed plan and the available DSH tools. For a requested change, file inspection, test, or browser operation, take the next authorized action in this step. A future-tense plan or a request to approve starting is insufficient. Pause for a specific missing permission, input or decision when genuinely necessary. Verify results against the acceptance criteria.',
-    'If a check fails twice, an interface behaves unexpectedly, or an unresolved design decision changes the plan, return control immediately with [ORCH:REPLAN] and explain the evidence and decision needed.',
-    'When ready for acceptance or when pausing for a progress check, start your final text with [ORCH:REVIEW] on its own line, then report completed work, tool evidence, remaining items and risks. The planner performs acceptance.',
+    'Carry out the latest request using the available tools. Resume from the latest result and verify the current artifact after changes, rebuilding it when needed. Reuse the current browser tab and its returned state. Capture new images for distinct visual checks or timed comparisons.',
+    'Use [ORCH:REPLAN] for a genuine blocker, repeated failure or necessary change of approach. Use [ORCH:REVIEW] when ready for acceptance. Include verified results, deliverable paths and remaining limits.',
   ] : [
-    'This is the read-only planner/reviewer step. You may inspect the available read/search tools and clarify essential user choices. Only the executor can perform changes or operate the browser. Do not claim effects that are absent from this session’s tool results.',
-    'For a question or review requiring no further action, or for completed verified work, start your final text with [ORCH:ANSWER] on its own line, then answer the user directly in their language. If essential input is missing you may ask them directly. Stop honestly when the task cannot proceed.',
-    'If the user asked for action, hand it to the executor now and let them work. An offer to start, proposed next steps, or an unsupported completion claim cannot close an action request. An explicit plan-only request can end with that plan. Use [ORCH:ANSWER] only for a terminal reply, without tool calls. For work requiring execution, start your final text with [ORCH:DELEGATE] on its own line. Follow with the concrete implementation plan, acceptance checks, and conditions for returning to you. A small settled follow-up only needs a short plan. For a review, compare actual evidence with the user’s request, then accept or hand specific remaining work back.',
+    'You are the read-only planner and reviewer. Use committed tool results and any checkpoint summary first. Read or observe only to settle a specific open question. Give file changes, commands and browser interactions to the executor.',
+    'Use [ORCH:ANSWER] for a direct answer, an explicit plan-only request, a concrete blocker or verified completion. Include deliverable links and verification limits where relevant. Ask the user only for a specific decision or input that is needed.',
+    'Use [ORCH:DELEGATE] for an action request or a revised approach. Give the next work and acceptance criteria, then hand off promptly. Keep routine checks and implementation details with the executor. If an optional lookup fails, continue from the evidence already available.',
+    ...(phase === 'review' && state.plan ? ['Use [ORCH:CONTINUE] to return to the current plan. Include only new findings and the next unchecked item.'] : []),
   ]
   const notes = [
     phase === 'replan' ? 'Revise the plan using the blocker and available evidence before handing back.' : '',
     reason === 'user_steering' ? 'The user steered the active turn. Reconcile their newest message with the executor’s progress and earlier requirements before taking the next decision.' : '',
-    reason === 'periodic_review' ? 'This is a scheduled progress review of a long execution. Inspect the committed tool results and prior plan.' : '',
-    reason === 'protocol' ? 'The preceding step did not provide a valid decision or requested tools outside its phase. Use the indicated decision line or one of the read-only tools you have actually been offered.' : '',
+    reason === 'periodic_review' ? 'Check recent results for blockers and steer the remaining work. Leave pending builds and multi-step checks with the executor. Accept only when the requested work is verified.' : '',
+    reason === 'protocol' ? 'Use a decision marker or an available tool to move the task forward.' : '',
     state.plan ? `Current implementation plan\n${state.plan}` : '',
     state.view.progress && state.view.progress !== state.plan ? `Latest progress or blocker\n${state.view.progress}` : '',
   ].filter(Boolean)
   return {
     source: { kind: SOURCE, form: 'notice', summary: `${phase} · ${actor.provider}/${actor.model}`.slice(0, 120), record: 'stage', version: 1, phase, reason, roles },
     content: [{ type: 'text', text: [`DSH orchestration · ${phase} · ${actor.provider}/${actor.model}`, ...guide, ...notes,
-      'A decision line belongs to the final text of this step. Use ordinary native tool calls for tool work. Keep the plan, report or answer below the line in the user’s language.'].join('\n\n') }],
+      'For a text decision, put its marker on the first line and write the body in the user’s language. Use ordinary native tool calls for tool work.'].join('\n\n') }],
   }
 }
 
@@ -183,13 +183,34 @@ export function untriedPreview(messages, guide) {
   return guide
 }
 
-const directive = /^\s*\[ORCH:(ANSWER|DELEGATE|REPLAN|REVIEW)\][ \t]*(?:\r?\n|$)/i
+const directive = /^\s*\[ORCH:(ANSWER|DELEGATE|REPLAN|REVIEW|CONTINUE)\][ \t]*(?:\r?\n|$)/i
+
+function lateHandoff(text) {
+  const marker = /([。！？.!?\n])[ \t]*\[ORCH:DELEGATE\][ \t]*\r?\n/i.exec(text)
+  if (!marker || text.match(/\[ORCH:[A-Z]+\]/gi)?.length !== 1) return ''
+  const before = text.slice(0, marker.index + marker[1].length).trim()
+  const after = text.slice(marker.index + marker[0].length).trim()
+  if (!after || /(?:```|~~~)/.test(before)) return ''
+  return [before, after].filter(Boolean).join('\n\n')
+}
 
 export function decide(phase, content, restricted, steer, evidence = {}) {
   if (steer) return { action: 'report', summary: 'A user message arrived before the pending tool batch was dispatched. Review the latest message and the work already recorded.', replace: true }
-  if (restricted.length) return { action: 'repair', summary: `This step did not dispatch the requested tool batch. Unavailable in this phase: ${[...new Set(restricted)].join(', ')}. Use an available read tool or hand the task to the executor.`, replace: true }
   const calls = content.filter(block => block.type === 'tool-call')
   const text = content.filter(block => block.type === 'text').map(block => block.text).join('\n').trim()
+  const match = directive.exec(text)
+  const marker = match?.[1].toUpperCase()
+  const summary = (match ? text.slice(match[0].length) : text).trim()
+  const canResume = ['review', 'replan'].includes(phase) && evidence.hasPlan
+  const canRecover = canResume && !evidence.resumedAutomatically
+  if (restricted.length) {
+    const names = [...new Set(restricted)].join(', ')
+    if (canRecover && restricted.every(name => evidence.executionOnly?.has(name))) {
+      const next = `Continue the outstanding work using the executor’s available tools. The reviewer requested ${names}. That batch did not run.`
+      return { action: 'resume', summary: summary ? `${next}\n\n${summary}` : next, corrected: true, automaticResume: true }
+    }
+    return { action: 'repair', summary: `This step did not dispatch the requested tool batch. Unavailable in this phase: ${names}. Use a tool offered in this step or issue a decision.`, replace: true }
+  }
   // Asking the user to authorize starting a web server can also be expressed
   // through DSH's question tool. Correct only this unsupported inference, never
   // a real policy decision or an explicitly requested server operation.
@@ -200,9 +221,16 @@ export function decide(phase, content, restricted, steer, evidence = {}) {
     return { action: phase === 'execute' ? 'repair' : 'delegate', summary: evidence.preview, replace: true, corrected: true }
   }
   if (calls.length) return { action: 'tools', summary: '', replace: false }
-  const match = directive.exec(text)
-  const marker = match?.[1].toUpperCase()
-  const summary = (match ? text.slice(match[0].length) : text).trim()
+  if (phase === 'review' && canResume && marker === 'CONTINUE') {
+    return { action: 'resume', summary: summary || 'Continue the current plan from the latest tool result.', corrected: !summary }
+  }
+  if (phase !== 'execute' && !marker && summary) {
+    const handoff = lateHandoff(summary)
+    if (handoff) return { action: 'delegate', summary: handoff, corrected: true }
+    if (canRecover && evidence.periodicReview && !blocker.test(summary)) {
+      return { action: 'resume', summary, automaticResume: true }
+    }
+  }
   const delivered = evidence.needsAction === 'svg' && /<svg\b[^>]*>[\s\S]*?<(?:g|path|circle|rect|line|polygon|use|image|text)\b[\s\S]*?<\/svg>/i.test(summary)
   if (summary && evidence.needsAction && !delivered && !blocker.test(summary)) {
     if (phase === 'execute' && marker !== 'REPLAN' && !evidence.executorTools) {

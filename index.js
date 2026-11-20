@@ -9,7 +9,7 @@ export const inject = ['llm', 'agents', 'commands', 'tools', 'sessionProjections
 const actorConfig = () => schema.object({ provider: schema.string().required(), model: schema.string().required(), reasoningEffort: schema.string() })
 export const Config = schema.object({
   roles: schema.union([schema.const(null), schema.object({ planner: actorConfig().required(), executor: actorConfig().required() })]).default(null).volatile(),
-  reviewEvery: schema.number().min(1).step(1).default(4).volatile(),
+  reviewEvery: schema.number().min(1).step(1).default(12).volatile(),
 })
 
 export async function apply(ctx, config) {
@@ -41,8 +41,14 @@ export async function apply(ctx, config) {
   ctx.effect(() => ctx.tools.guard(exec => {
     if (!exec.agent) return
     const state = read(exec.agent.session)
-    if (state.view.enabled && ['plan', 'replan', 'review'].includes(state.dispatch) && !readOnlyTool(exec.name)) {
+    if (!state.view.enabled || state.lastDirective < 0) return
+    if (['plan', 'replan', 'review'].includes(state.dispatch) && !readOnlyTool(exec.name)) {
       return 'The current orchestration step is read-only. Hand work requiring this tool to the executor.'
+    }
+    const questions = exec.arguments?.questions
+    if (exec.name === 'ask_user_question' && Array.isArray(questions)
+        && (!questions.length || questions.some(item => typeof item?.question === 'string' && !item.question.trim()))) {
+      return 'Ask a specific, non-blank question only when a user decision is needed. Otherwise continue the task.'
     }
   }))
 }

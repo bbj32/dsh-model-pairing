@@ -41,7 +41,8 @@ const viewSchema = z.object({
 const stateSchema = z.object({
   view: viewSchema, override: pairSchema.nullable(), roles: pairSchema.nullable(), turn: z.number().int(),
   dispatch: phaseSchema, plan: z.string(), continueStep: z.boolean(), batches: z.number().int(),
-  successfulTools: scalar, executorTools: scalar, repairs: z.number().int(), lastConfiguredSeq: z.number().int(), lastDirective: z.number().int(), commands: z.record(z.string(), z.string()),
+  resumedAutomatically: z.boolean(), successfulTools: scalar, executorTools: scalar, repairs: z.number().int(),
+  lastConfiguredSeq: z.number().int(), lastDirective: z.number().int(), commands: z.record(z.string(), z.string()),
   calls: z.record(z.string(), z.object({ name: z.string(), key: z.string() })), failures: z.record(z.string(), z.number().int()),
 })
 
@@ -60,7 +61,8 @@ function idleView() {
 
 export function initialState() {
   return { view: idleView(), override: null, roles: null, turn: 0, dispatch: 'idle', plan: '', continueStep: false,
-    batches: 0, successfulTools: 0, executorTools: 0, repairs: 0, lastConfiguredSeq: -1, lastDirective: -1, commands: {}, calls: {}, failures: {} }
+    batches: 0, resumedAutomatically: false, successfulTools: 0, executorTools: 0, repairs: 0,
+    lastConfiguredSeq: -1, lastDirective: -1, commands: {}, calls: {}, failures: {} }
 }
 
 export function receiptOf(message) {
@@ -112,6 +114,8 @@ function recordAssistant(state, record, usage) {
   let repairs = 0
   if (action === 'delegate') {
     phase = 'execute'; reason = 'handoff'; plan = record.summary; rounds++; batches = 0; failures = {}
+  } else if (action === 'resume') {
+    phase = 'execute'; reason = 'handoff'; batches = 0
   } else if (action === 'report') {
     phase = 'review'; reason = 'executor_report'; batches = 0
   } else if (action === 'replan') {
@@ -125,7 +129,9 @@ function recordAssistant(state, record, usage) {
   } else if (action === 'tools' && stage === 'execute' && ++batches >= record.reviewEvery) {
     phase = 'review'; reason = 'periodic_review'; batches = 0
   }
-  return { ...state, dispatch: stage, plan, batches, failures, repairs, continueStep: ['delegate', 'report', 'replan', 'repair'].includes(action),
+  return { ...state, dispatch: stage, plan, batches, failures, repairs,
+    resumedAutomatically: state.resumedAutomatically || record.automaticResume === true,
+    continueStep: ['delegate', 'resume', 'report', 'replan', 'repair'].includes(action),
     view: { ...state.view, phase, reason, rounds, progress, usage: addUsage(state.view.usage, stage, record.actor, usage) } }
 }
 
@@ -138,7 +144,10 @@ function recordResult(state, data) {
   const failed = data.message.isError || failedExit
   if (state.dispatch !== 'execute') return { ...state, calls, successfulTools: state.successfulTools + Number(!failed) }
   const failures = { ...state.failures }
-  if (!failed) { delete failures[call.key]; return { ...state, calls, failures, successfulTools: state.successfulTools + 1, executorTools: state.executorTools + 1 } }
+  if (!failed) {
+    delete failures[call.key]
+    return { ...state, calls, failures, resumedAutomatically: false, successfulTools: state.successfulTools + 1, executorTools: state.executorTools + 1 }
+  }
   const count = (failures[call.key] ?? 0) + 1
   failures[call.key] = count
   if (count < 2) return { ...state, calls, failures }
@@ -179,6 +188,7 @@ export function fold(state, event) {
       const source = data.source
       if (source?.kind !== SOURCE || source.record !== 'stage' || source.version !== 1) return state
       return { ...state, roles: source.roles, dispatch: source.phase, continueStep: false, lastDirective: event.seq,
+        resumedAutomatically: state.resumedAutomatically && source.reason !== 'user_steering',
         view: { ...state.view, enabled: true, phase: source.phase, reason: source.reason, selection: source.roles } }
     }
     case 'assistant/message': {
@@ -221,5 +231,5 @@ export function fold(state, event) {
   }
 }
 
-export const projection = { key: KEY, stateVersion: 2, stateSchema, init: initialState, apply: fold,
+export const projection = { key: KEY, stateVersion: 3, stateSchema, init: initialState, apply: fold,
   wire: { viewSchema, view: state => state.view, summary: false } }

@@ -8,22 +8,22 @@
 2. 在 DSH 打开「插件 → 添加插件」，粘贴下面的安装地址。
 
    ```text
-   https://github.com/bbj32/dsh-model-pairing/releases/download/v1.1.1/workbuddy-dsh-antigravity-orchestrator-1.1.1.tgz
+   https://github.com/bbj32/dsh-model-pairing/releases/download/v1.2.0/workbuddy-dsh-antigravity-orchestrator-1.2.0.tgz
    ```
 
 3. 点击安装并启用「DSH 模型配对」。如果插件管理器提示重启，按提示重启 DSH。安装后显示的包名是 `@workbuddy/dsh-antigravity-orchestrator`。
 
-也可以下载并解压对应版本的源码，在安装框输入 DSH 主机上插件根目录的绝对路径。DSH 直接从这里加载插件，请保留这个目录。[v1.1.1 源码 ZIP](https://github.com/bbj32/dsh-model-pairing/archive/refs/tags/v1.1.1.zip)
+也可以下载并解压对应版本的源码，在安装框输入 DSH 主机上插件根目录的绝对路径。DSH 直接从这里加载插件，请保留这个目录。[v1.2.0 源码 ZIP](https://github.com/bbj32/dsh-model-pairing/archive/refs/tags/v1.2.0.zip)
 
 ## 使用
 
 在 DSH 会话中打开模型菜单，点「DSH 模型配对」，分别选择规划模型、执行模型及各自的思考级别，再点「启用配对」。两个角色可以使用同一模型，也可以跨提供方。角色使用 DSH 已配置的模型、权限、工具和计费。运行时直接调用这些提供方，两个角色在自己的步骤中都能看到该会话的上下文。
 
-每个新用户轮次先由规划模型只读检查。它可直接回答问题，或把具体计划、验收条件和需要重新规划的情形交给执行模型。执行通过本会话的 DSH 工具完成。执行模型报告阻碍、同一校验操作失败两次、用户在执行中插话或长任务达到复核间隔时，规划模型会检查证据并决定继续、修改计划或结束。执行模型提交的完成报告还会经过一次规划模型验收。用户插话在 DSH 下一步骤生效，已经进入执行的工具遵循 DSH 自己的取消语义。
+每个新用户轮次先由规划模型只读检查，再直接回答或把计划和验收条件交给执行模型。执行遇阻、同一校验操作失败两次、用户插话、达到进度复核间隔或提交完成报告时，规划模型会根据已有证据决定继续、调整计划或验收。进度复核可以沿用当前计划，只补充下一项待验收工作。复核误选执行侧工具时，插件可将后续工作交回执行模型，由它按 DSH 原生工具流程处理。
 
-进行中的角色和阶段显示在输入区。配对按会话保存，默认配对可在配置窗口设置。变更默认配对在后续轮次生效。关闭配对会恢复该会话使用的单模型及显式思考级别，也可在 DSH 原生菜单直接选择模型。Host 默认每四批执行工具进行一次进度复核，插件设置 `reviewEvery` 可调整这个本地间隔。
+进行中的角色和阶段显示在输入区。配对按会话保存，默认配对可在配置窗口设置。变更默认配对在后续轮次生效。关闭配对会恢复原来的单模型及显式思考级别。默认每十二批执行工具进行一次进度复核，插件设置 `reviewEvery` 可调整间隔。用户插话在下一步骤生效，已开始的工具遵循 DSH 的取消语义。
 
-规划和复核阶段只开放明确的读取、搜索、询问等工具。配对 1.1.1 可与内置浏览器 1.3.0、1.3.1 配合使用。启用浏览器后，规划者可用 `browser_observe` 观察当前页签，执行者可用 `browser_act` 操作，或用 `browser_task` 委派独立浏览任务。执行侧保留原生工具的审批、取消、调用结果和当前会话归属。仅开放程序化工具 `run_code` 的预设仍可执行工具，规划者在这种预设中依据已记录的信息规划。该插件使用 DSH 实现 Google 公开描述的编排流程。模型名称及输出来自用户选定的 DSH 提供方。[Google Antigravity 模型文档](https://antigravity.google/docs/models#orchestrator)
+规划和复核阶段开放读取、搜索和必要的提问。插件会拦截空白提问，同批的有效工具照常执行。启用内置浏览器后，规划者可用 `browser_observe` 观察当前页签，执行者可用 `browser_act` 操作，或用 `browser_task` 委派浏览任务。明确声明支持图片输入的角色可以使用原生 `read_image`，混合配对也会保留图片供视觉角色读取。工具遵循 DSH 原有的审批、取消和会话归属。仅开放 `run_code` 的预设由执行角色调用该工具，规划角色使用已有记录。该插件使用 DSH 实现 Google 公开描述的编排流程。模型名称及输出来自用户选定的 DSH 提供方。[Google Antigravity 模型文档](https://antigravity.google/docs/models#orchestrator)
 
 ## 对话和缓存
 
@@ -69,7 +69,7 @@ $env:ELECTRON_RUN_AS_NODE = '1'
 node --test test/smoke.mjs test/client.mjs test/cache.mjs
 ```
 
-可选的浏览器集成测试会用两个合成模型在临时工作区打开一个动态 SVG，比较两张 PNG，检查控制台和最终答复。准备 `dsh-browser` 1.3.1 的源码或解包目录，以及本机安装的 Edge、Chrome 或 Chromium。将 `DSH_TEST_BROWSER_DIR` 设为含 `host.js` 的浏览器插件目录。如浏览器安装在自定义位置，用 `DSH_BROWSER_EXECUTABLE` 指定可执行文件的绝对路径。[内置浏览器](https://github.com/bbj32/dsh-browser)
+可选的浏览器集成测试会在临时工作区打开动态 SVG，比较两张截图并检查控制台。测试还会读回 PNG，检查旧图卸载后能否继续执行，以及混合配对是否只向视觉角色提供原生图片读取。准备 `dsh-browser` 1.3.1 的源码或解包目录，以及本机安装的 Edge、Chrome 或 Chromium。将 `DSH_TEST_BROWSER_DIR` 设为浏览器插件根目录。如浏览器安装在自定义位置，用 `DSH_BROWSER_EXECUTABLE` 指定可执行文件的绝对路径。[内置浏览器](https://github.com/bbj32/dsh-browser)
 
 ```powershell
 $env:DSH_TEST_BROWSER_DIR = (Resolve-Path (Read-Host '浏览器插件目录')).Path
@@ -80,9 +80,9 @@ $env:DSH_TEST_BROWSER_DIR = (Resolve-Path (Read-Host '浏览器插件目录')).P
 
 ## English
 
-Install version 1.1.1 in DSH **Plugins → Add plugin**. Paste the HTTPS asset link for `workbuddy-dsh-antigravity-orchestrator-1.1.1.tgz`, or enter the absolute path to this source directory on the DSH host. Enable **DSH model pairing** and follow any restart prompt. The package is `@workbuddy/dsh-antigravity-orchestrator` and declares DSH `>=0.2.2-rc.5 <0.3.0`. [GitHub Releases](https://github.com/bbj32/dsh-model-pairing/releases)
+Install version 1.2.0 in DSH **Plugins → Add plugin**. Paste the HTTPS asset link for `workbuddy-dsh-antigravity-orchestrator-1.2.0.tgz`, or enter the absolute path to this source directory on the DSH host. Enable **DSH model pairing** and follow any restart prompt. The package is `@workbuddy/dsh-antigravity-orchestrator` and declares DSH `>=0.2.2-rc.5 <0.3.0`. [GitHub Releases](https://github.com/bbj32/dsh-model-pairing/releases)
 
-Open the conversation model menu, choose **DSH model pairing**, select a planning model and an execution model, and enable the pairing. The planner inspects read-only tools, answers questions or hands a plan to the executor. The executor uses the session’s native tools and returns evidence for review. The planner also checks long-running work, handles new user input and revises the plan after blockers or repeated failures. Both roles receive the session context during their own steps and use their providers’ ordinary quotas. **Switch to single model** restores the previous selection. The Host and Web Client load together from the same bundle.
+Open the conversation model menu, choose **DSH model pairing**, select a planning model and an execution model, and enable the pairing. The planner inspects read-only tools, answers questions or hands a plan to the executor. The executor uses the session’s native tools and returns evidence for review. Progress review runs after twelve executor tool batches by default. The planner can resume the current plan, handle new user input and revise the plan after blockers or repeated failures. Both roles receive the session context during their own steps and use their providers’ ordinary quotas. **Switch to single model** restores the previous selection. The Host and Web Client load together from the same bundle.
 
 Model pairing runs independently. For web tasks, the optional browser adds observation, interaction and delegated browsing. [Built-in browser](https://github.com/bbj32/dsh-browser)
 

@@ -39,9 +39,10 @@ class ScriptedAdapter extends LlmAdapter {
       yield { type: 'text-delta', index: 0, text: response.text.slice(6) }
       yield { type: 'block-end', index: 0, block: { type: 'text', text: response.text } }
     }
-    if (response.call) yield { type: 'block-end', index: response.text ? 1 : 0, block: response.call }
+    const calls = response.calls ?? (response.call ? [response.call] : [])
+    for (const [index, block] of calls.entries()) yield { type: 'block-end', index: index + Number(Boolean(response.text)), block }
     yield { type: 'usage', usage: { inputTokens: 3, outputTokens: 2 } }
-    yield { type: 'finish', reason: { kind: response.call ? 'tool-calls' : 'stop' }, replayState: { response: { fixture: this.provider } } }
+    yield { type: 'finish', reason: { kind: calls.length ? 'tool-calls' : 'stop' }, replayState: { response: { fixture: this.provider } } }
   }
 }
 
@@ -54,7 +55,8 @@ async function send(agent, prompt, sequence, expected = 'completed') {
   const ending = events.findLast(event => event.type === 'turn/end')
   assert.equal(ending?.data.reason.kind, expected, JSON.stringify(ending?.data.reason))
   assert.equal(scripts.get(agent.id).length, 0)
-  const turn = events.filter(event => event.data.turn === ending.data.turn)
+  const start = events.findLast(event => event.type === 'turn/start')
+  const turn = events.filter(event => event.seq >= start.seq && event.seq <= ending.seq)
   const values = root.sessionProjections.snapshot(agent.session, [KEY]).values[KEY]
   assert.deepEqual(events.reduce(fold, initialState()).view, values, 'cold log replay equals live wire projection')
   return { values, messages: turn.filter(event => event.type === 'assistant/message').map(event => event.data.message), turn }
@@ -83,8 +85,11 @@ try {
     effects.push(exec.agent.id); return 'Same tab, action applied'
   }, 'Open workspace SVGs directly by file URL or path.', { action: { type: 'string', enum: ['new', 'navigate'] }, url: { type: 'string' } })
   let questions = 0
-  tool('ask_user_question', async () => { questions++; return 'Fixture user answer.' }, 'Request user input.', { question: { type: 'string' } })
-  tool('pwsh', async () => '[exit code: 1]')
+  tool('ask_user_question', async () => { questions++; return 'Fixture user answer.' }, 'Request user input.', {
+    questions: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, question: { type: 'string' } } } },
+  })
+  tool('edit', async () => 'Source updated.')
+  tool('pwsh', async ({ command }) => command === 'build fixture' ? 'Build completed.' : '[exit code: 1]', 'Run a scripted check.', { command: { type: 'string' } })
   const { agent: a } = await localAgent('orchestration-smoke-a')
   const { agent: b } = await localAgent('orchestration-smoke-b')
   assert.equal((await ok(a)).enabled, false)
@@ -114,8 +119,59 @@ try {
   const repaired = await send(a, 'Handle failed validation', [delegate('Run the check.'), requestTool('pwsh', 'bad1'), requestTool('pwsh', 'bad2'), delegate('Use another check.'), { text: '[ORCH:REPLAN]\nInterface disagrees with the plan.' }, delegate('Use the verified interface.'), { text: 'Verified the interface.' }, answer('Reviewed')])
   assert.ok(repaired.messages.some(m => receiptOf(m).phase === 'replan')); assert.equal(repaired.values.rounds, 3)
   console.log('PASS repeated failed exit status, explicit executor escalation, revised plans and final review')
-  const periodic = await send(a, 'Long task', [delegate('Inspect incrementally.'), ...[1, 2, 3, 4].map(i => requestTool('read', `long${i}`)), answer('Verified during periodic review.')])
+  const periodic = await send(a, 'Build an offline HTML demo.', [
+    delegate('Build the HTML and verify the released artifact.'),
+    ...[1, 2, 3].map(i => requestTool('read', `prep-${i}`)),
+    requestTool('edit', 'first-edit'), requestTool('pwsh', 'first-build', { command: 'build fixture' }),
+    ...[6, 7, 8, 9, 10, 11].map(i => requestTool('read', `check-${i}`)),
+    requestTool('edit', 'last-edit'),
+    { text: '## 审查结论\n补丁已写入，当前浏览器仍运行旧版。先构建，再确认微距性能。' },
+    (row) => {
+      assert.equal(row.phase, 'execute')
+      const notice = textOf(row.messages.findLast(m => m.source?.record === 'stage'))
+      assert.match(notice, /Build the HTML and verify the released artifact/)
+      assert.match(notice, /先构建，再确认微距性能/)
+      return requestTool('pwsh', 'last-build', { command: 'build fixture' })
+    },
+    { text: '[ORCH:REVIEW]\nThe updated HTML was built and verified.' }, answer('Verified the updated HTML.'),
+  ])
+  assert.deepEqual(periodic.messages.slice(1, 13).map(m => receiptOf(m).phase), Array(12).fill('execute'))
+  assert.equal(receiptOf(periodic.messages[13]).action, 'resume')
+  assert.equal(periodic.values.rounds, 1)
+  assert.equal(periodic.turn.filter(e => e.data.source?.reason === 'periodic_review').length, 1)
   assert.equal(receiptOf(periodic.messages.at(-1)).phase, 'review')
+  assert.ok(periodic.turn.some(e => e.type === 'tool/result' && e.data.message.toolCallId === 'last-build' && !e.data.message.isError))
+  console.log('PASS default checkpoint at twelve batches, uninterrupted edit/build at batch four, and unmarked progress review resumes the plan')
+  const recovered = await send(a, 'Check and finish the local build.', [
+    delegate('Check the pending edit and build the updated artifact.'),
+    { text: '[ORCH:REVIEW]\nThe edit is in place. The build still needs to run.' },
+    { text: '[ORCH:REVIEW]\nThe build is pending.' },
+    requestTool('pwsh', 'reviewer-build', { command: 'build fixture' }),
+    (row) => {
+      assert.equal(row.phase, 'execute')
+      assert.match(textOf(row.messages.findLast(m => m.source?.record === 'stage')), /requested pwsh/)
+      return requestTool('pwsh', 'executor-build', { command: 'build fixture' })
+    },
+    { text: '[ORCH:REVIEW]\nBuilt. One final check is pending.' },
+    { text: '[ORCH:CONTINUE]\nCheck the updated output.' },
+    requestTool('read', 'check-built'), { text: '[ORCH:REVIEW]\nThe output check passed.' }, answer('Verified and complete.'),
+  ])
+  assert.deepEqual(recovered.messages.map(m => receiptOf(m).action), ['delegate', 'report', 'repair', 'resume', 'tools', 'report', 'resume', 'tools', 'report', 'answer'])
+  assert.equal(recovered.turn.some(e => e.type === 'tool/call' && e.data.callId === 'reviewer-build'), false)
+  assert.ok(recovered.turn.some(e => e.type === 'tool/result' && e.data.message.toolCallId === 'executor-build' && !e.data.message.isError))
+  const bounded = await send(a, 'Check the pending build.', [
+    delegate('Verify the output.'), { text: '[ORCH:REVIEW]\nStill pending.' }, requestTool('pwsh', 'first-rejected'),
+    { text: '[ORCH:REVIEW]\nNo progress.' }, requestTool('pwsh', 'second-rejected'), answer('The build remains pending.'),
+  ])
+  assert.deepEqual(bounded.messages.map(m => receiptOf(m).action), ['delegate', 'report', 'resume', 'report', 'repair', 'answer'])
+  assert.equal(bounded.turn.some(e => e.type === 'tool/call'), false)
+  const lateMarker = await send(a, 'Finish the requested checks.', [
+    { text: '还需要验证。[ORCH:DELEGATE]\n请读取最新的报告。' }, requestTool('read', 'latest-report'),
+    { text: '[ORCH:REVIEW]\n报告已核对。' }, answer('检查完成。'),
+  ])
+  assert.equal(receiptOf(lateMarker.messages[0]).summary, '还需要验证。\n\n请读取最新的报告。')
+  assert.equal(textOf(lateMarker.messages[0]), '')
+  console.log('PASS misplaced handoff marker, known execution tool recovery after repair, explicit resume, and bounded automatic recovery')
   const blocked = await send(a, 'Planner tried to modify', [requestTool('browser_act', 'forbidden'), answer('Read-only')])
   assert.deepEqual(effects, [a.id]); assert.equal(blocked.turn.some(event => event.type === 'tool/call'), false)
   const steered = await send(a, 'Steer in flight', [delegate('Open tab.'), () => { a.steer(human('Stop opening the tab; answer now.')); return requestTool('browser_act', 'stale') }, answer('Stopped as requested.')])
@@ -153,7 +209,7 @@ try {
   assert.equal(workspacePreviewGuide([{ name: originalName, description: 'Open a workspace SVG' }]), '')
   assert.equal(readOnlyTool('antigravity_browser_observe'), false)
   const directSvg = await send(a, pathRequest, [(_row, o) => { assert.match(o.system, /workspace SVG directly/); return answer(serverClaim) },
-    requestTool('ask_user_question', 'unneeded-server-question', { question: serverClaim }),
+    requestTool('ask_user_question', 'unneeded-server-question', { questions: [{ id: 'server', question: serverClaim }] }),
     requestTool('browser_act', 'direct-svg', { action:'navigate', url:'./pelican.svg' }), { text:'[ORCH:REVIEW]\nThe SVG was rendered directly.' }, answer('已打开文件并核验外观。')])
   assert.deepEqual(directSvg.messages.map(m => receiptOf(m).action), ['delegate','repair','tools','report','answer'])
   assert.equal(questions, 0); assert.equal(directSvg.turn.filter(e=>e.type==='tool/call').length, 1)
@@ -176,6 +232,22 @@ try {
   } finally { undoBrowser() }
   await send(a, '为什么打开 pelican.svg 有时需要本地 HTTP 服务？', [answer('服务端的 URL 可供不同页面引用。')])
   console.log('PASS direct scoped workspace SVG capability, no unnecessary Python or approval question, genuine permission denial, unavailable browser and informational question')
+  const clarification = await send(a, 'Check the report.', [
+    { calls: [
+      requestTool('ask_user_question', 'blank-question', { questions: [{ id: 'no-op', question: ' \u3000' }] }).call,
+      requestTool('read', 'paired-read').call,
+    ] },
+    requestTool('ask_user_question', 'empty-questions', { questions: [] }),
+    requestTool('ask_user_question', 'valid-question', { questions: [{ id: 'report', question: 'Which report should I inspect?' }] }),
+    answer('The report was checked.'),
+  ])
+  const resultOf = id => clarification.turn.find(e => e.type === 'tool/result' && e.data.message.toolCallId === id)?.data.message
+  assert.match(textOf(resultOf('blank-question')), /non-blank question/)
+  assert.match(textOf(resultOf('empty-questions')), /non-blank question/)
+  assert.equal(resultOf('paired-read').isError, false)
+  assert.equal(resultOf('valid-question').isError, false)
+  assert.equal(questions, 1)
+  console.log('PASS blank and empty question guards, mixed-batch native read, and real clarification')
   const maxed = await send(a, '打开这个本地 SVG 并核验', [answer('I will open it. Shall I begin?'), { text: 'I will open the file now.' }, { text: 'I will start now.' }], 'error')
   assert.equal(maxed.values.phase, 'error'); assert.ok(maxed.turn.some(e => e.data.reason?.error?.code === 'ORCHESTRATOR_PROTOCOL'))
   console.log('PASS real SVG action, no future-tense final or white handoff, inline SVG and plan-only answers, real missing path, bounded repair')
