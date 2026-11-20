@@ -38,9 +38,21 @@ const viewSchema = z.object({
   enabled: z.boolean(), configured: z.boolean(), phase: phaseSchema, reason: z.string(), progress: z.string(), rounds: z.number().int(),
   selection: pairSchema.nullable(), previous: roleSchema.nullable(), usage: usageSchema,
 })
+const resumablePhases = ['execute', 'review', 'replan']
+const continuationPrompt = /^(?:(?:请\s*)?继续(?:\s*(?:吧|执行|操作|(?:上次|刚才)的?任务))?|接着做|(?:please\s+)?(?:continue|resume)(?:\s+(?:please|the (?:previous|last) task))?)[\s.!?。！？]*$/iu
+
+export function isContinuationMessage(message) {
+  return message?.source?.kind === 'user' && message.content.length > 0 && message.content.every(block => block.type === 'text')
+    && continuationPrompt.test(message.content.map(block => block.text).join(' ').trim())
+}
+
+const continuationSchema = z.object({
+  phase: z.enum(resumablePhases), reason: z.string(), plan: z.string().min(1), progress: z.string(),
+  rounds: scalar, batches: scalar, successfulTools: scalar, executorTools: scalar,
+})
 const stateSchema = z.object({
   view: viewSchema, override: pairSchema.nullable(), roles: pairSchema.nullable(), turn: z.number().int(),
-  dispatch: phaseSchema, plan: z.string(), continueStep: z.boolean(), batches: z.number().int(),
+  dispatch: phaseSchema, plan: z.string(), continuation: continuationSchema.nullable(), continueStep: z.boolean(), batches: z.number().int(),
   resumedAutomatically: z.boolean(), successfulTools: scalar, executorTools: scalar, repairs: z.number().int(),
   lastConfiguredSeq: z.number().int(), lastDirective: z.number().int(), commands: z.record(z.string(), z.string()),
   calls: z.record(z.string(), z.object({ name: z.string(), key: z.string() })), failures: z.record(z.string(), z.number().int()),
@@ -60,7 +72,7 @@ function idleView() {
 }
 
 export function initialState() {
-  return { view: idleView(), override: null, roles: null, turn: 0, dispatch: 'idle', plan: '', continueStep: false,
+  return { view: idleView(), override: null, roles: null, turn: 0, dispatch: 'idle', plan: '', continuation: null, continueStep: false,
     batches: 0, resumedAutomatically: false, successfulTools: 0, executorTools: 0, repairs: 0,
     lastConfiguredSeq: -1, lastDirective: -1, commands: {}, calls: {}, failures: {} }
 }
@@ -76,7 +88,7 @@ function selectRoute(state, route) {
   if (enabled === state.view.enabled && (enabled || JSON.stringify(state.view.previous) === JSON.stringify(realRoute(route)))) return state
   const previous = realRoute(route) ?? state.view.previous
   const view = { ...state.view, enabled, previous, phase: 'idle', progress: '', reason: '', rounds: 0 }
-  return { ...state, view, roles: null, dispatch: 'idle', continueStep: false, lastDirective: -1 }
+  return { ...state, view, roles: null, continuation: null, dispatch: 'idle', continueStep: false, lastDirective: -1 }
 }
 
 function settleCommand(state, data, seq) {
@@ -169,7 +181,7 @@ export function fold(state, event) {
     case 'session/end-seed': {
       if (!data.inherited) return state
       // A fork sees its ancestor's transcript, but its own accounting starts at its creation boundary.
-      return { ...state, view: { ...state.view, usage: { planner: emptyUsage(), executor: emptyUsage() } } }
+      return { ...state, continuation: null, view: { ...state.view, usage: { planner: emptyUsage(), executor: emptyUsage() } } }
     }
     case 'model/selection': return selectRoute(state, data)
     case 'request/header': {
@@ -181,15 +193,21 @@ export function fold(state, event) {
       return selectRoute(state, { ...config, reasoningEffort: adapterDefaults?.reasoningEffort ? undefined : config.reasoningEffort })
     }
     case 'turn/start': {
-      const next = { ...initialState(), commands: state.commands, override: state.override, lastConfiguredSeq: state.lastConfiguredSeq, turn: data.turn }
+      const next = { ...initialState(), commands: state.commands, override: state.override, lastConfiguredSeq: state.lastConfiguredSeq,
+        continuation: state.continuation, turn: data.turn }
       return { ...next, view: state.view.enabled ? { ...state.view, phase: 'plan', reason: 'new_turn', progress: '', rounds: 0 } : state.view }
     }
     case 'user/message': {
       const source = data.source
+      if (source?.kind === 'user' && state.continuation && !isContinuationMessage(data)) return { ...state, continuation: null }
       if (source?.kind !== SOURCE || source.record !== 'stage' || source.version !== 1) return state
+      const pending = source.reason === 'continuation' ? state.continuation : null
       return { ...state, roles: source.roles, dispatch: source.phase, continueStep: false, lastDirective: event.seq,
+        continuation: pending ? null : state.continuation,
+        ...(pending ? { plan: pending.plan, batches: pending.batches, successfulTools: pending.successfulTools, executorTools: pending.executorTools } : {}),
         resumedAutomatically: state.resumedAutomatically && source.reason !== 'user_steering',
-        view: { ...state.view, enabled: true, phase: source.phase, reason: source.reason, selection: source.roles } }
+        view: { ...state.view, enabled: true, phase: source.phase, reason: pending?.reason ?? source.reason, selection: source.roles,
+          ...(pending ? { rounds: pending.rounds, progress: pending.progress } : {}) } }
     }
     case 'assistant/message': {
       const record = receiptOf(data.message)
@@ -224,12 +242,21 @@ export function fold(state, event) {
       if (!state.view.enabled) return state
       const reason = data.reason.kind
       if (reason === 'completed' && state.view.phase === 'complete') return state
+      const { phase: activePhase, reason: activeReason, progress, rounds } = state.view
+      const canContinue = ['error', 'aborted', 'interrupted'].includes(reason) && state.plan.trim() && resumablePhases.includes(activePhase)
+      // Older versions sent a bare continuation through planning. Preserve the
+      // prior unfinished work when that extra turn failed before handing it off.
+      const failedLegacyContinuation = activePhase === 'plan' && reason === 'error' && data.reason.error?.code === 'ORCHESTRATOR_PROTOCOL'
+      const continuation = canContinue ? {
+        phase: activePhase, reason: activeReason, plan: state.plan, progress, rounds,
+        batches: state.batches, successfulTools: state.successfulTools, executorTools: state.executorTools,
+      } : failedLegacyContinuation ? state.continuation : null
       const phase = ['aborted', 'interrupted', 'forked', 'completed'].includes(reason) ? 'idle' : 'error'
-      return { ...state, continueStep: false, calls: {}, dispatch: 'idle', view: { ...state.view, phase, reason, progress: data.reason.error?.message ?? '' } }
+      return { ...state, continuation, continueStep: false, calls: {}, dispatch: 'idle', view: { ...state.view, phase, reason, progress: data.reason.error?.message ?? '' } }
     }
     default: return state
   }
 }
 
-export const projection = { key: KEY, stateVersion: 3, stateSchema, init: initialState, apply: fold,
+export const projection = { key: KEY, stateVersion: 4, stateSchema, init: initialState, apply: fold,
   wire: { viewSchema, view: state => state.view, summary: false } }

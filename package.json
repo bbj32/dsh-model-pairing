@@ -1,6 +1,6 @@
 {
   "name": "@workbuddy/dsh-antigravity-orchestrator",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "private": true,
   "license": "MIT",
   "repository": { "type": "git", "url": "git+https://github.com/bbj32/dsh-model-pairing.git" },

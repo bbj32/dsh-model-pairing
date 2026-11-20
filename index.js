@@ -28,7 +28,9 @@ export async function apply(ctx, config) {
     if (phase === 'complete' || phase === 'idle' || phase === 'error') { phase = 'review'; reason = 'user_steering' }
     const changed = state.dispatch !== phase || state.lastDirective < 0 || state.continueStep || reason === 'user_steering'
     if (!changed) return decision
-    const notice = createUserMessage(stageMessage(phase, reason, pair, state))
+    const pending = reason === 'continuation' ? state.continuation : null
+    const stageState = pending ? { plan: pending.plan, view: { progress: pending.progress } } : state
+    const notice = createUserMessage(stageMessage(phase, reason, pair, stageState))
     return { ...decision, messages: [...decision.messages, notice] }
   })
   ctx.on('agent/turn-stopping', ({ agent, turn, signal }) => {

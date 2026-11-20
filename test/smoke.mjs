@@ -5,7 +5,7 @@ import * as plugin from '../index.js'
 import { mountStorage } from './pairing-storage.mjs'
 import { LlmAdapter, createUserMessage } from '../runtime.js'
 import { KEY, fold, initialState, receiptOf } from '../state.js'
-import { readOnlyTool, untriedPreview, workspacePreviewGuide } from '../roles.js'
+import { phaseFor, readOnlyTool, stageMessage, untriedPreview, workspacePreviewGuide } from '../roles.js'
 
 const requireHost = createRequire(join(process.env.DSH_INSTALL_DIR, 'package.json'))
 const { Context } = requireHost('@deepseek-ai/cordis')
@@ -270,6 +270,60 @@ try {
   await a.whenIdle()
   assert.equal(a.session.snapshotEvents().findLast(event => event.type === 'turn/end').data.reason.kind, 'aborted')
   await send(a, 'New turn after cancellation', [answer('Fresh plan')])
+
+  const disconnected = { failure: { message: 'Connection error.', code: 'TRANSPORT' } }
+  const interrupted = await send(a, 'Build and verify the HTML demo.', [
+    delegate('Keep the built demo and verify the latest preview.'),
+    requestTool('pwsh', 'demo-build', { command: 'build fixture' }),
+    disconnected,
+  ], 'error')
+  assert.equal(interrupted.turn.at(-1).data.reason.error.code, 'TRANSPORT')
+  assert.equal(interrupted.values.phase, 'error')
+  const pending = a.session.snapshotEvents().reduce(fold, initialState())
+  const legacy = [
+    { type: 'turn/start', data: { turn: pending.turn + 1 } },
+    { type: 'user/message', data: human('继续') },
+    { type: 'user/message', data: stageMessage('plan', 'new_turn', roles, initialState()) },
+    { type: 'turn/end', data: { reason: { kind: 'error', error: { code: 'ORCHESTRATOR_PROTOCOL' } } } },
+    { type: 'turn/start', data: { turn: pending.turn + 2 } },
+  ].reduce(fold, pending)
+  assert.deepEqual(phaseFor(legacy, 1, [human('继续')]), { phase: 'execute', reason: 'continuation' })
+  assert.equal(fold(legacy, { type: 'session/end-seed', data: { inherited: true } }).continuation, null)
+  await send(a, '继续', [disconnected], 'error')
+  assert.equal(rowsFor(a.id).at(-1).phase, 'execute')
+  const resumed = await send(a, '继续', [
+    requestTool('browser_act', 'verify-after-retry'),
+    { text: '[ORCH:REVIEW]\nThe built demo was verified in the browser.' }, answer('The demo is verified.'),
+  ])
+  assert.deepEqual(resumed.messages.map(message => receiptOf(message).phase), ['execute', 'execute', 'review'])
+  assert.deepEqual(resumed.turn.filter(event => event.type === 'tool/call').map(event => event.data.name), ['browser_act'])
+  const resumedRequest = rowsFor(a.id).at(-3)
+  assert.ok(resumedRequest.messages.some(message => message.toolCallId === 'demo-build' && !message.isError))
+  const resumedNotice = resumedRequest.messages.findLast(message => message.source?.record === 'stage')
+  assert.match(textOf(resumedNotice), /Keep the built demo and verify the latest preview/)
+  assert.equal(resumed.values.rounds, 1)
+  await send(a, '继续', [answer('The earlier request is complete.')])
+  assert.equal(rowsFor(a.id).at(-1).phase, 'plan')
+
+  await send(b, 'Build the second demo.', [
+    delegate('Build and record the output.'), requestTool('pwsh', 'second-build', { command: 'build fixture' }),
+    { text: '[ORCH:REVIEW]\nThe second build completed.' }, disconnected,
+  ], 'error')
+  await ok(b, `set ${JSON.stringify(roles)}`)
+  const review = await send(b, 'Please continue.', [row => {
+    assert.equal(row.phase, 'review')
+    assert.equal(row.provider, roles.planner.provider)
+    assert.ok(!row.tools.includes('pwsh'))
+    const notice = row.messages.findLast(message => message.source?.record === 'stage')
+    assert.match(textOf(notice), /second build completed/)
+    return answer('The second build passed final review.')
+  }])
+  assert.equal(review.values.reason, 'reviewed')
+  await send(b, 'Build the third demo.', [delegate('Build the third demo.'), disconnected], 'error')
+  await send(b, 'Explain a new topic.', [row => { assert.equal(row.phase, 'plan'); return disconnected }], 'error')
+  await send(b, '继续', [answer('Continuing the explanation.')])
+  assert.equal(rowsFor(b.id).at(-1).phase, 'plan')
+  console.log('PASS continue after a transport error restores execution or read-only review, honors the newly selected pair, and clears stale work')
   const { sessionFormatCatalog } = requireHost('@deepseek-ai/dsh-session-format-catalog')
   const header = sessionFormatCatalog.encodeCurrentHeader({ ...a.session.header, delegationDepth: a.session.header.delegationDepth ?? 0 }, a.session.inheritedEventCount)
   const restore = sessionFormatCatalog.createRestore(header, { recovery: 'strict', validation: 'current' })

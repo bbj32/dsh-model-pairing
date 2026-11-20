@@ -8,18 +8,20 @@
 2. 在 DSH 打开「插件 → 添加插件」，粘贴下面的安装地址。
 
    ```text
-   https://github.com/bbj32/dsh-model-pairing/releases/download/v1.2.0/workbuddy-dsh-antigravity-orchestrator-1.2.0.tgz
+   https://github.com/bbj32/dsh-model-pairing/releases/download/v1.2.1/workbuddy-dsh-antigravity-orchestrator-1.2.1.tgz
    ```
 
 3. 点击安装并启用「DSH 模型配对」。如果插件管理器提示重启，按提示重启 DSH。安装后显示的包名是 `@workbuddy/dsh-antigravity-orchestrator`。
 
-也可以下载并解压对应版本的源码，在安装框输入 DSH 主机上插件根目录的绝对路径。DSH 直接从这里加载插件，请保留这个目录。[v1.2.0 源码 ZIP](https://github.com/bbj32/dsh-model-pairing/archive/refs/tags/v1.2.0.zip)
+也可以下载并解压对应版本的源码，在安装框输入 DSH 主机上插件根目录的绝对路径。DSH 直接从这里加载插件，请保留这个目录。[v1.2.1 源码 ZIP](https://github.com/bbj32/dsh-model-pairing/archive/refs/tags/v1.2.1.zip)
 
 ## 使用
 
 在 DSH 会话中打开模型菜单，点「DSH 模型配对」，分别选择规划模型、执行模型及各自的思考级别，再点「启用配对」。两个角色可以使用同一模型，也可以跨提供方。角色使用 DSH 已配置的模型、权限、工具和计费。运行时直接调用这些提供方，两个角色在自己的步骤中都能看到该会话的上下文。
 
 每个新用户轮次先由规划模型只读检查，再直接回答或把计划和验收条件交给执行模型。执行遇阻、同一校验操作失败两次、用户插话、达到进度复核间隔或提交完成报告时，规划模型会根据已有证据决定继续、调整计划或验收。进度复核可以沿用当前计划，只补充下一项待验收工作。复核误选执行侧工具时，插件可将后续工作交回执行模型，由它按 DSH 原生工具流程处理。
+
+任务在已有计划后因模型报错或停止而中断时，可以在同一会话发送「继续」或 `continue`。配对会回到中断前的执行、复核或重新规划阶段，并沿用计划和已记录的工具结果。
 
 进行中的角色和阶段显示在输入区。配对按会话保存，默认配对可在配置窗口设置。变更默认配对在后续轮次生效。关闭配对会恢复原来的单模型及显式思考级别。默认每十二批执行工具进行一次进度复核，插件设置 `reviewEvery` 可调整间隔。用户插话在下一步骤生效，已开始的工具遵循 DSH 的取消语义。
 
@@ -52,7 +54,7 @@
 
 | 测试 | 涵盖内容 |
 | --- | --- |
-| [smoke.mjs](test/smoke.mjs) | 角色交接、只读规划、工具执行、复核、取消以及会话重放 |
+| [smoke.mjs](test/smoke.mjs) | 角色交接、只读规划、工具执行、复核、断线续作、取消以及会话重放 |
 | [client.mjs](test/client.mjs) | 模型菜单、权限、会话与默认配对、恢复单模型 |
 | [cache.mjs](test/cache.mjs) | 每个角色的请求前缀、跨轮复用、切换模型及缓存用量统计 |
 
@@ -80,9 +82,9 @@ $env:DSH_TEST_BROWSER_DIR = (Resolve-Path (Read-Host '浏览器插件目录')).P
 
 ## English
 
-Install version 1.2.0 in DSH **Plugins → Add plugin**. Paste the HTTPS asset link for `workbuddy-dsh-antigravity-orchestrator-1.2.0.tgz`, or enter the absolute path to this source directory on the DSH host. Enable **DSH model pairing** and follow any restart prompt. The package is `@workbuddy/dsh-antigravity-orchestrator` and declares DSH `>=0.2.2-rc.5 <0.3.0`. [GitHub Releases](https://github.com/bbj32/dsh-model-pairing/releases)
+Install version 1.2.1 in DSH **Plugins → Add plugin**. Paste the HTTPS asset link for `workbuddy-dsh-antigravity-orchestrator-1.2.1.tgz`, or enter the absolute path to this source directory on the DSH host. Enable **DSH model pairing** and follow any restart prompt. The package is `@workbuddy/dsh-antigravity-orchestrator` and declares DSH `>=0.2.2-rc.5 <0.3.0`. [GitHub Releases](https://github.com/bbj32/dsh-model-pairing/releases)
 
-Open the conversation model menu, choose **DSH model pairing**, select a planning model and an execution model, and enable the pairing. The planner inspects read-only tools, answers questions or hands a plan to the executor. The executor uses the session’s native tools and returns evidence for review. Progress review runs after twelve executor tool batches by default. The planner can resume the current plan, handle new user input and revise the plan after blockers or repeated failures. Both roles receive the session context during their own steps and use their providers’ ordinary quotas. **Switch to single model** restores the previous selection. The Host and Web Client load together from the same bundle.
+Open the conversation model menu, choose **DSH model pairing**, select a planning model and an execution model, and enable the pairing. The planner inspects read-only tools, answers questions or hands a plan to the executor. The executor uses the session’s native tools and returns evidence for review. Progress review runs after twelve executor tool batches by default. The planner can resume the current plan, handle new user input and revise the plan after blockers or repeated failures. After a model error or stop, send `continue` in the same conversation to resume the unfinished stage using the existing plan and committed results. Both roles receive the session context during their own steps and use their providers’ ordinary quotas. **Switch to single model** restores the previous selection. The Host and Web Client load together from the same bundle.
 
 Model pairing runs independently. For web tasks, the optional browser adds observation, interaction and delegated browsing. [Built-in browser](https://github.com/bbj32/dsh-browser)
 

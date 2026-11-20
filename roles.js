@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { SOURCE, receiptOf, roleForPhase } from './state.js'
+import { SOURCE, isContinuationMessage, receiptOf, roleForPhase } from './state.js'
 
 // Only operations with a read-only contract enter planner/reviewer requests.
 // A tool that combines navigation, editing or execution with observation belongs
@@ -16,6 +16,12 @@ export function readOnlyTool(name) { return reads.has(name) }
 export function isHumanMessage(message) { return message.source?.kind === 'user' }
 
 export function phaseFor(state, step, messages) {
+  if (step === 1 && state.continuation) {
+    const inputs = messages.filter(isHumanMessage)
+    if (inputs.length === 1 && isContinuationMessage(inputs[0])) {
+      return { phase: state.continuation.phase, reason: 'continuation' }
+    }
+  }
   if (!state.roles || step === 1) return { phase: 'plan', reason: 'new_turn' }
   if (messages.some(isHumanMessage)) return { phase: 'review', reason: 'user_steering' }
   return { phase: state.view.phase, reason: state.view.reason }
@@ -35,6 +41,7 @@ export function stageMessage(phase, reason, roles, state) {
   ]
   const notes = [
     phase === 'replan' ? 'Revise the plan using the blocker and available evidence before handing back.' : '',
+    reason === 'continuation' ? 'The user asked to continue unfinished work. Use the original request and committed tool results. Resume with the first unchecked item. Verify uncertain outcomes before retrying an operation.' : '',
     reason === 'user_steering' ? 'The user steered the active turn. Reconcile their newest message with the executor’s progress and earlier requirements before taking the next decision.' : '',
     reason === 'periodic_review' ? 'Check recent results for blockers and steer the remaining work. Leave pending builds and multi-step checks with the executor. Accept only when the requested work is verified.' : '',
     reason === 'protocol' ? 'Use a decision marker or an available tool to move the task forward.' : '',
@@ -136,7 +143,21 @@ const operation = /^(?:(?:请你|请|麻烦你|麻烦|帮我|给我|帮忙|现�
 const drawSvg = /(?:用\s*svg\s*(?:给我)?(?:画|绘制|做|生成|制作)|(?:画|绘制|做|生成|制作).{0,28}svg|(?:draw|create|generate|make)\b.{0,65}\bsvg\b)/i
 const externalSvg = /保存(?:为|到)|写入|另存|浏览器.{0,8}(?:实测|打开|核验)|(?:并|然后|再)(?:在浏览器中)?(?:打开|实测|验证|检查)|\b(?:save|write to|open it|verify in|in the browser)\b/i
 const messageText = message => message?.content.filter(block => block.type === 'text').map(block => block.text).join('\n').trim() ?? ''
-const requestedMessage = messages => messages.findLast(message => isHumanMessage(message) && messageText(message) && !acknowledge.test(messageText(message)))
+const isRequest = message => isHumanMessage(message) && messageText(message)
+  && !isContinuationMessage(message) && !acknowledge.test(messageText(message))
+
+function requestedMessage(messages) {
+  const lastInput = messages.findLastIndex(isHumanMessage)
+  const latest = messages[lastInput]
+  if (!isContinuationMessage(latest)) return messages.findLast(isRequest)
+  // A bare continuation after a final answer does not reopen its tool actions.
+  for (let index = lastInput - 1; index >= 0; index--) {
+    const message = messages[index]
+    if (receiptOf(message)?.action === 'answer') return latest
+    if (isRequest(message)) return message
+  }
+  return latest
+}
 export function actionRequest(messages) {
   const text = messageText(requestedMessage(messages))
   if (planOnly.test(text)) return false
