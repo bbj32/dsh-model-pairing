@@ -1,0 +1,4 @@
+- insert:
+    - id: workbuddy-model-orchestration
+      name: '@workbuddy/dsh-antigravity-orchestrator'
+      config: {}

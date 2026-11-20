@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "DSH model pairing",
+    "description": "Select a planning model, an execution model and their reasoning settings in the conversation model menu. The pair works on one request and answers in the main conversation. Open the pairing window to see cache usage for each role or return to the previous single model."
+  }
+}

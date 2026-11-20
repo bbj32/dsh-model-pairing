@@ -1,0 +1,231 @@
+import { createHash } from 'node:crypto'
+import { SOURCE, receiptOf, roleForPhase } from './state.js'
+
+// Only operations with a read-only contract enter planner/reviewer requests.
+// A tool that combines navigation, editing or execution with observation belongs
+// to the executor. Unknown tools are available there through the normal preset.
+const reads = new Set([
+  'read', 'read_image', 'glob', 'grep', 'skill', 'web_search', 'web_fetch',
+  'cordis_inspect_list', 'cordis_inspect_query', 'session_search', 'session_trace',
+  'session_event_search', 'session_event_read', 'session_event_trace',
+  'list_agents', 'list_subagent_models', 'browser_observe', 'ask_user_question',
+])
+
+export function readOnlyTool(name) { return reads.has(name) }
+
+export function isHumanMessage(message) { return message.source?.kind === 'user' }
+
+export function phaseFor(state, step, messages) {
+  if (!state.roles || step === 1) return { phase: 'plan', reason: 'new_turn' }
+  if (messages.some(isHumanMessage)) return { phase: 'review', reason: 'user_steering' }
+  return { phase: state.view.phase, reason: state.view.reason }
+}
+
+export function stageMessage(phase, reason, roles, state) {
+  const executor = phase === 'execute'
+  const actor = executor ? roles.executor : roles.planner
+  const guide = executor ? [
+    'Carry out the latest user request now. Use the agreed plan and the available DSH tools. For a requested change, file inspection, test, or browser operation, take the next authorized action in this step. A future-tense plan or a request to approve starting is insufficient. Pause for a specific missing permission, input or decision when genuinely necessary. Verify results against the acceptance criteria.',
+    'If a check fails twice, an interface behaves unexpectedly, or an unresolved design decision changes the plan, return control immediately with [ORCH:REPLAN] and explain the evidence and decision needed.',
+    'When ready for acceptance or when pausing for a progress check, start your final text with [ORCH:REVIEW] on its own line, then report completed work, tool evidence, remaining items and risks. The planner performs acceptance.',
+  ] : [
+    'This is the read-only planner/reviewer step. You may inspect the available read/search tools and clarify essential user choices. Only the executor can perform changes or operate the browser. Do not claim effects that are absent from this session’s tool results.',
+    'For a question or review requiring no further action, or for completed verified work, start your final text with [ORCH:ANSWER] on its own line, then answer the user directly in their language. If essential input is missing you may ask them directly. Stop honestly when the task cannot proceed.',
+    'If the user asked for action, hand it to the executor now and let them work. An offer to start, proposed next steps, or an unsupported completion claim cannot close an action request. An explicit plan-only request can end with that plan. Use [ORCH:ANSWER] only for a terminal reply, without tool calls. For work requiring execution, start your final text with [ORCH:DELEGATE] on its own line. Follow with the concrete implementation plan, acceptance checks, and conditions for returning to you. A small settled follow-up only needs a short plan. For a review, compare actual evidence with the user’s request, then accept or hand specific remaining work back.',
+  ]
+  const notes = [
+    phase === 'replan' ? 'Revise the plan using the blocker and available evidence before handing back.' : '',
+    reason === 'user_steering' ? 'The user steered the active turn. Reconcile their newest message with the executor’s progress and earlier requirements before taking the next decision.' : '',
+    reason === 'periodic_review' ? 'This is a scheduled progress review of a long execution. Inspect the committed tool results and prior plan.' : '',
+    reason === 'protocol' ? 'The preceding step did not provide a valid decision or requested tools outside its phase. Use the indicated decision line or one of the read-only tools you have actually been offered.' : '',
+    state.plan ? `Current implementation plan\n${state.plan}` : '',
+    state.view.progress && state.view.progress !== state.plan ? `Latest progress or blocker\n${state.view.progress}` : '',
+  ].filter(Boolean)
+  return {
+    source: { kind: SOURCE, form: 'notice', summary: `${phase} · ${actor.provider}/${actor.model}`.slice(0, 120), record: 'stage', version: 1, phase, reason, roles },
+    content: [{ type: 'text', text: [`DSH orchestration · ${phase} · ${actor.provider}/${actor.model}`, ...guide, ...notes,
+      'A decision line belongs to the final text of this step. Use ordinary native tool calls for tool work. Keep the plan, report or answer below the line in the user’s language.'].join('\n\n') }],
+  }
+}
+
+// V4's physical codec can reorder object properties on restore. Hash semantic
+// JSON fields in a stable order. IDs/timestamps of DSH log rows never go on wire.
+function canonical(value) {
+  return JSON.stringify(value, (_, item) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return item
+    return Object.fromEntries(Object.keys(item).sort().map(key => [key, item[key]]))
+  })
+}
+export function digest(value) { return createHash('sha256').update(canonical(value)).digest('hex') }
+
+function assistantHistory(message, record, binding, before) {
+  const actor = record.actor
+  const source = { kind: 'model', provider: actor.provider, model: actor.model }
+  const native = record.native
+  const intact = native && native.surface === digest(message.content)
+  const same = intact && native.scope === binding && native.before === before
+  // Never resurrect removed/replaced text from cached full transcripts. Only
+  // invert the documented presentation edits on the CURRENT surface. A rewrite
+  // or prefix change cannot reactivate a signature, response id or tool batch.
+  const content = message.content.flatMap((block, i) => {
+    if (intact && native.text?.includes(i)) {
+      return [{ type: 'text', text: (same && native.first === i ? native.prefix ?? '' : '') + block.text }]
+    }
+    if (block.type === 'reasoning' && !same) return []
+    if (same && native.first === i && block.type === 'text' && native.prefix) return [{ ...block, text: native.prefix + block.text }]
+    return [block]
+  })
+  if (same && record.inner !== undefined) source.replayState = record.inner
+  return { ...message, content, source }
+}
+
+// Auxiliary title/compaction requests get only the currently visible surface.
+// Provider-private replay is valid only in the original role's exact prefix.
+export function neutralMessages(messages) {
+  return messages.map(message => {
+    const record = receiptOf(message)
+    return record ? assistantHistory(message, record, null, null) : message
+  })
+}
+
+// Local preview was added after the browser's first release. A tool
+// name alone neither admits the tool in this step nor guarantees this feature.
+export function workspacePreviewGuide(tools = []) {
+  const advertisesSvg = tool => /workspace.{0,40}svg|svg.{0,45}workspace/i.test(`${tool.description ?? ''} ${tool.parameters?.properties?.url?.description ?? ''}`)
+  const navigation = tools.find(tool => tool.name === 'browser_act' && advertisesSvg(tool))
+  if (navigation) return 'The executor can open a regular workspace SVG directly using browser_act with action new or navigate and its relative path, absolute path or file:/// URL in url. Observe the resulting tab. No HTTP server is needed. Honor actual missing-file, approval and access results.'
+  if (tools.some(tool => tool.name === 'browser_task' && advertisesSvg(tool))) return 'The executor can give the workspace SVG path and visual checks to browser_task for direct preview. No HTTP server is needed. Honor actual missing-file, approval and access results.'
+  return ''
+}
+
+export function roleRequest(options, config, stage, tools, previewGuide = '') {
+  const role = roleForPhase(stage)
+  const scope = digest(['dsh-pair/v2', options.sessionId, role, config]).slice(0, 32)
+  const system = [`DSH model pairing · ${role} · ${scope}`, previewGuide, options.system].filter(Boolean).join('\n\n')
+  const chain = createHash('sha256').update(canonical([system, tools]))
+  const messages = []
+  for (let message of options.messages) {
+    if (message.source?.kind === SOURCE) {
+      if (message.source.record !== 'stage' || roleForPhase(message.source.phase) !== role) continue
+    }
+    const record = receiptOf(message)
+    if (record) {
+      message = assistantHistory(message, record, scope, chain.copy().digest('hex'))
+      if (!message.content.length) continue
+    } else if (message.role === 'assistant') {
+      // Pre-pairing turns, interrupted responses and foreign assistant messages
+      // have no binding to either role. Keep portable content and tool pairings.
+      const { provider, model } = message.source
+      const content = message.content.filter(block => block.type !== 'reasoning')
+      if (!content.length) continue
+      message = { ...message, content, source: { kind: 'model', provider, model } }
+    }
+    messages.push(message)
+    const native = message.role === 'assistant' ? message.source : null
+    chain.update('\0').update(canonical([message.role, message.content, native, message.toolCallId ?? null, message.isError ?? null]))
+  }
+  return { system, messages, scope, before: chain.digest('hex') }
+}
+
+// Deliberately narrow execution evidence check. An informational or plan-only
+// request may end in the planner, and a specific blocker may be asked directly.
+const acknowledge = /^(?:好(?:的|啊|吧)?|行|可以|继续(?:吧|执行|操作)?|开始(?:吧|执行)?|确认|同意|yes|sure|ok(?:ay)?|continue|proceed|go ahead)(?:[\s，,]+(?:继续|开始|执行|continue|proceed))?[\s.!。！]*$/i
+const planOnly = /(?:只(?:想|要|需要|需|给|提供|列|写)|仅(?:需|要|给|提供|列|写)|仅仅)[^。！？\n]{0,24}(?:方案|计划|思路|步骤|说明)|(?:plan|explanation|instructions) only|(?:only|just) (?:give|provide|write|want).{0,22}(?:plan|instructions)/i
+const negativeClause = /^(?:(?:请|先|please)\s*)?(?:不要|不用|暂不|无需|先别|禁止|do not|don't|never)\s*/i
+const operation = /^(?:(?:请你|请|麻烦你|麻烦|帮我|给我|帮忙|现在|直接|顺便|然后|先|并且|并|只|能否|能不能|可以帮我|把|将)\s*)*(?:打开|浏览|访问|点击|下载|上传|修改|编辑|删除|修复|安装|运行|执行|构建|部署|测试|核验|保存|写入|检查这个文件|验证这个文件)|^(?:(?:please|now|then|and|could you|can you|would you|go ahead and)\s+)*(?:open|visit|browse|click|download|upload|edit|modify|delete|fix|install|run|deploy|build|test|save|write to)\b/i
+const drawSvg = /(?:用\s*svg\s*(?:给我)?(?:画|绘制|做|生成|制作)|(?:画|绘制|做|生成|制作).{0,28}svg|(?:draw|create|generate|make)\b.{0,65}\bsvg\b)/i
+const externalSvg = /保存(?:为|到)|写入|另存|浏览器.{0,8}(?:实测|打开|核验)|(?:并|然后|再)(?:在浏览器中)?(?:打开|实测|验证|检查)|\b(?:save|write to|open it|verify in|in the browser)\b/i
+const messageText = message => message?.content.filter(block => block.type === 'text').map(block => block.text).join('\n').trim() ?? ''
+const requestedMessage = messages => messages.findLast(message => isHumanMessage(message) && messageText(message) && !acknowledge.test(messageText(message)))
+export function actionRequest(messages) {
+  const text = messageText(requestedMessage(messages))
+  if (planOnly.test(text)) return false
+  const clauses = text.split(/[。！？!?；;，,\n]|\.\s+/).map(clause => clause.trim()).filter(clause => !negativeClause.test(clause))
+  if (clauses.some(clause => operation.test(clause))) return 'external'
+  if (!clauses.some(clause => drawSvg.test(clause))) return false
+  return clauses.some(clause => externalSvg.test(clause)) ? 'external' : 'svg'
+}
+
+const blocker = /(?:\b(?:permission|access) (?:was |is )?denied\b|\b(?:file|path|url|directory|account) (?:is |was )?(?:missing|not found|unavailable)|\b(?:I (?:cannot|can't|couldn't)|I(?:'m| am) unable to) (?:access|locate|open|identify|authenticate|connect|fulfill)|\bwhich (?:one|file|directory|path|site|environment)|\b(?:need|provide|specify) (?:the |your |a )?(?:exact |full )?(?:path|url|login|credentials|permission))|(?:权限不足|访问被拒绝|没有(?:此|该|读取|写入|访问|打开)?权限|(?:未找到|找不到|缺少)(?:此|该|指定的|可用的)?(?:文件|目录|路径|输入|网址|工具|授权)|无法(?:访问|定位|打开|连接|登录)|请(?:先)?(?:提供|指定|选择|确认).{0,18}(?:路径|文件|网址|账号|登录|授权)|(?:哪个|哪一个)(?:文件|目录|路径|环境))/i
+const futurePlan = /(?:shall|should|may|can|would you like) (?:i|me to) (?:begin|start|proceed|go ahead|continue|open|run)|\bI(?:'ll| will| plan to)\b|(?:是否|要不要|需要我|可以开始|要我)(?:.{0,8})(?:开始|继续|打开|执行|动手)|(?:我(?:将|会|准备)|下一步(?:是|我会))/i
+
+const server = /(?:http(?:s)?\s*(?:server|serv(?:ice)?|服务)|python(?:\s+-m\s+http\.server|.{0,18}(?:http|server|服务))|(?:本地|静态)(?:服务器|服务)|localhost|local (?:web )?server)/i
+const fileLimitation = /(?:file:\/{2,3}|本地(?:文件|路径)|local (?:files?|paths?)).{0,65}(?:cannot|can.t|unable|unsupported|blocked|not (?:available|supported|allowed)|不支持|不能|无法|不允许)|(?:cannot|can.t|unable|unsupported|blocked|不支持|不能|无法|不允许).{0,65}(?:file:\/{2,3}|本地(?:文件|路径)|local (?:files?|paths?))/i
+export function untriedPreview(messages, guide) {
+  if (!guide) return ''
+  const requested = requestedMessage(messages)
+  const text = messageText(requested)
+  if (planOnly.test(text)) return ''
+  const clauses = text.split(/[。！？!?；;，,\n]|\.\s+/).map(part => part.trim()).filter(part => !negativeClause.test(part))
+  if (!clauses.some(part => operation.test(part) || /^(?:(?:请|帮我|麻烦|直接|可以)\s*)*(?:(?:用|在|使用)(?:共享|内置)?浏览器(?:中|里)?\s*)?(?:预览|核验|检查|查看|截图|打开)|^(?:(?:please|can you|could you)\s+)*(?:preview|render|inspect|verify|screenshot)\b/i.test(part))) return ''
+  if (clauses.some(part => server.test(part) && /(?:启动|运行|搭建|架设|\b(?:start|serve|launch|run)\b|python\s+-m\s+http\.server)/i.test(part))) return ''
+  const local = clauses.join(' ').replace(/https?:\/\/[^\s<>"'`，。]+/gi, '').match(/[^\s/\\:"'`<>，。；！？(（)）]+\.svg\b/i)
+  if (!local) return ''
+  const file = /[\p{Script=Latin}\p{N}_.-]+\.svg$/iu.exec(local[0])?.[0].toLowerCase() ?? local[0].toLowerCase()
+  const calls = new Map()
+  for (const msg of messages.slice(messages.indexOf(requested) + 1)) {
+    if (msg.role === 'assistant') for (const block of msg.content) {
+      if (block.type !== 'tool-call') continue
+      const target = block.arguments.toLowerCase()
+      let readable = target
+      try { readable = decodeURIComponent(target).toLowerCase() } catch { /* Some tool arguments contain literal percent signs. */ }
+      const targetNames = readable.match(/[^\s/\\:"'`<>，。；！？(（)）]+\.svg\b/gi) ?? []
+      if (targetNames.some(name => file === name || file.endsWith(name) || name.endsWith(file))) calls.set(block.id, block.name)
+    }
+    if (msg.role === 'tool' && calls.has(msg.toolCallId)) {
+      const name = calls.get(msg.toolCallId)
+      // A returned browser state (including a pending human decision) or a
+      // real filesystem/policy error is evidence; do not override it.
+      // Prior releases committed the original tool name in this session's history.
+      if (['browser_act', 'browser_task', 'antigravity_browser_act'].includes(name) || msg.isError || blocker.test(messageText(msg))) return ''
+    }
+  }
+  return guide
+}
+
+const directive = /^\s*\[ORCH:(ANSWER|DELEGATE|REPLAN|REVIEW)\][ \t]*(?:\r?\n|$)/i
+
+export function decide(phase, content, restricted, steer, evidence = {}) {
+  if (steer) return { action: 'report', summary: 'A user message arrived before the pending tool batch was dispatched. Review the latest message and the work already recorded.', replace: true }
+  if (restricted.length) return { action: 'repair', summary: `This step did not dispatch the requested tool batch. Unavailable in this phase: ${[...new Set(restricted)].join(', ')}. Use an available read tool or hand the task to the executor.`, replace: true }
+  const calls = content.filter(block => block.type === 'tool-call')
+  const text = content.filter(block => block.type === 'text').map(block => block.text).join('\n').trim()
+  // Asking the user to authorize starting a web server can also be expressed
+  // through DSH's question tool. Correct only this unsupported inference, never
+  // a real policy decision or an explicitly requested server operation.
+  const questionOnly = calls.length && calls.every(call => call.name === 'ask_user_question')
+  const claim = questionOnly ? calls.map(call => call.arguments).join('\n') : text
+  if (evidence.preview && (!calls.length || questionOnly) && server.test(claim)
+    && (fileLimitation.test(claim) || /(?:需要|必须|启动|搭建|允许|授权|\b(?:need|must|start|launch|permission)\b)/i.test(claim))) {
+    return { action: phase === 'execute' ? 'repair' : 'delegate', summary: evidence.preview, replace: true, corrected: true }
+  }
+  if (calls.length) return { action: 'tools', summary: '', replace: false }
+  const match = directive.exec(text)
+  const marker = match?.[1].toUpperCase()
+  const summary = (match ? text.slice(match[0].length) : text).trim()
+  const delivered = evidence.needsAction === 'svg' && /<svg\b[^>]*>[\s\S]*?<(?:g|path|circle|rect|line|polygon|use|image|text)\b[\s\S]*?<\/svg>/i.test(summary)
+  if (summary && evidence.needsAction && !delivered && !blocker.test(summary)) {
+    if (phase === 'execute' && marker !== 'REPLAN' && !evidence.executorTools) {
+      return { action: 'repair', summary: 'Carry out the authorized action using an available tool, or identify the specific missing permission, input or capability.', replace: true }
+    }
+    if (phase !== 'execute' && marker === 'ANSWER' && (!evidence.successfulTools || futurePlan.test(summary))) {
+      return { action: 'delegate', summary: 'Carry out the original user request now. Use the available tools and verify the result before returning it for review.', replace: true, corrected: true }
+    }
+  }
+  if (summary && phase === 'execute') {
+    return { action: marker === 'REPLAN' ? 'replan' : 'report', summary, replace: !!marker }
+  }
+  if (summary && (marker === 'DELEGATE' || marker === 'ANSWER')) {
+    return { action: marker === 'DELEGATE' ? 'delegate' : 'answer', summary, replace: true }
+  }
+  return { action: 'repair', summary: summary || 'A non-empty decision is required.', replace: true }
+}
+
+export function protocolPrefix(text) { return directive.exec(text)?.[0] ?? '' }
+
+export function prefixForStreaming(text, phase) {
+  const match = directive.exec(text)
+  if (!match || !match[0].endsWith('\n')) return null
+  if (phase !== 'execute' && match[1].toUpperCase() === 'ANSWER') return match[0].length
+  return null
+}
